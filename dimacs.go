@@ -30,6 +30,11 @@ func ParseDIMACS(r io.Reader) ([][]int, error) {
 		if len(line) == 0 || line[0] == 'c' {
 			continue
 		}
+		// Some CNF formats attach extra data in a trailer after a line
+		// containing a single %.
+		if line == "%" {
+			break
+		}
 		if line[0] == 'p' {
 			if len(clauses) > 0 {
 				return nil, errors.New("problem line appears after clauses")

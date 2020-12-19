@@ -8,30 +8,65 @@ import (
 )
 
 func TestFixtures(t *testing.T) {
+	for _, tt := range loadFixtures(t) {
+		if tt.sat {
+			t.Run(tt.name, func(t *testing.T) {
+				testFixtureSat(t, tt.problem)
+			})
+		} else {
+			t.Run(tt.name, func(t *testing.T) {
+				testFixtureUnsat(t, tt.problem)
+			})
+		}
+	}
+}
+
+func BenchmarkFixtures(b *testing.B) {
+	for _, bb := range loadFixtures(b) {
+		b.Run(bb.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				sv := newSolver(bb.problem)
+				sv.solve()
+				b.ReportMetric(float64(sv.numDecisions), "decisions/op")
+				b.ReportMetric(float64(sv.numImplications), "implications/op")
+			}
+		})
+	}
+}
+
+type fixtureTest struct {
+	name    string
+	problem [][]int
+	sat     bool
+}
+
+func loadFixtures(tb testing.TB) []fixtureTest {
 	filenames, err := filepath.Glob("testdata/*.cnf")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
+	var tests []fixtureTest
 	for _, filename := range filenames {
 		f, err := os.Open(filename)
 		if err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 		problem, err := ParseDIMACS(f)
 		f.Close()
 		if err != nil {
-			t.Fatalf("bad fixture %s: %s", filename, err)
+			tb.Fatalf("bad fixture %s: %s", filename, err)
 		}
 		name := filepath.Base(filename)
 		switch {
 		case strings.HasSuffix(filename, ".sat.cnf"):
-			t.Run(name, func(t *testing.T) { testFixtureSat(t, problem) })
+			tests = append(tests, fixtureTest{name, problem, true})
 		case strings.HasSuffix(filename, ".unsat.cnf"):
-			t.Run(name, func(t *testing.T) { testFixtureUnsat(t, problem) })
+			tests = append(tests, fixtureTest{name, problem, false})
 		default:
-			t.Fatalf("bad testdata CNF filename: %q", filename)
+			tb.Fatalf("bad testdata CNF filename: %q", filename)
 		}
 	}
+	return tests
 }
 
 func testFixtureSat(t *testing.T, problem [][]int) {
