@@ -10,14 +10,16 @@ type solver struct {
 	origVars []int
 
 	assignments []assnVal
+	watches     [][]int // watch literals (one for each literal; len is 2*len(assignments))
 
 	unassigned      []int // unassigned vars (indexes into assignments; unordered)
 	unassignedIndex []int // index of each var in unassigned (or -1)
 
 	decisions    []decision // assigned vars from decision
-	implications []int      // assigned vars from decisions & further implications
+	implications []literal  // implied literals from decisions & further implications
+	propIndex    int        // index of the first un-propagated implication
 
-	clauses [][]literal
+	clauses []clause
 
 	bcpBuf []literal
 
@@ -25,11 +27,18 @@ type solver struct {
 	numImplications int64
 }
 
+type clause struct {
+	watches [2]literal
+	lits    []literal
+}
+
+const verbose = false
+
 func newSolver(cnf [][]int) *solver {
 	sv := new(solver)
 	vars := make(map[int]int)
-	for _, clause := range cnf {
-		for _, v := range clause {
+	for _, cls := range cnf {
+		for _, v := range cls {
 			if v == 0 {
 				panic("zero value passed to Solve")
 			}
@@ -53,10 +62,13 @@ func newSolver(cnf [][]int) *solver {
 		sv.unassignedIndex[i] = len(sv.origVars) - i - 1
 	}
 	sv.assignments = make([]assnVal, len(sv.origVars))
-	sv.clauses = make([][]literal, len(cnf))
-	for i, clause := range cnf {
-		sv.clauses[i] = make([]literal, len(clause))
-		for j, v := range clause {
+	sv.watches = make([][]int, len(sv.origVars)*2)
+	sv.clauses = make([]clause, len(cnf))
+	for i, cls := range cnf {
+		var watchesAdded int
+		// Detect and delete duplicates.
+		seen := make(map[literal]struct{}, len(cls))
+		for _, v := range cls {
 			neg := false
 			if v < 0 {
 				neg = true
@@ -66,7 +78,16 @@ func newSolver(cnf [][]int) *solver {
 			if neg {
 				lit ^= 1
 			}
-			sv.clauses[i][j] = lit
+			if _, ok := seen[lit]; ok {
+				continue
+			}
+			seen[lit] = struct{}{}
+			sv.clauses[i].lits = append(sv.clauses[i].lits, lit)
+			if watchesAdded < 2 {
+				sv.watches[lit] = append(sv.watches[lit], i)
+				sv.clauses[i].watches[watchesAdded] = lit
+				watchesAdded++
+			}
 		}
 	}
 	return sv
@@ -93,6 +114,8 @@ func Solve(cnf [][]int) ([]int, bool) {
 // A literal represents an instance of a variable or its negation in a clause.
 // The value is 2 times the variable value (index) or 2x+1 for negation.
 type literal uint32
+
+const litNone literal = 1<<32 - 1
 
 func (l literal) assn() assnVal {
 	return assnVal(l&1) + 1
@@ -128,7 +151,9 @@ type decision struct {
 
 func (sv *solver) solve() bool {
 	for {
-		// fmt.Println("solve loop")
+		if verbose {
+			fmt.Println("solve loop", sv.unassigned)
+		}
 		v, ok := sv.popUnassigned()
 		if !ok {
 			return true
@@ -136,17 +161,15 @@ func (sv *solver) solve() bool {
 		// Decide: set a var to true.
 		sv.assignments[v] = assnTrue
 		sv.numDecisions++
-		// fmt.Printf("assigning %d to true | %s\n", v, sv.stateString())
+		if verbose {
+			fmt.Printf("assigning %d->true | %s\n", sv.origVars[v], sv.stateString())
+		}
 		sv.decisions = append(sv.decisions, decision{
 			implicationIdx: len(sv.implications),
 			v:              v,
 		})
-		sv.implications = append(sv.implications, v)
-
-		// sv.bcpCount++
-		// if sv.bcpCount > 1000 {
-		// 	return false
-		// }
+		sv.propIndex = len(sv.implications)
+		sv.implications = append(sv.implications, literal(v<<1))
 
 		for !sv.bcp() {
 			if !sv.resolveConflict() {
@@ -156,74 +179,107 @@ func (sv *solver) solve() bool {
 	}
 }
 
+func intsContain(s []int, n int) bool {
+	for _, n1 := range s {
+		if n1 == n {
+			return true
+		}
+	}
+	return false
+}
+
 // bcp carries out boolean constraint propagation (BCP) which finds all the
 // direct implications of the current variable state. It returns true once there
 // are no more implications to be made or false if it locates a conflict.
 func (sv *solver) bcp() bool {
 	for {
-		// fmt.Println("  bcp loop")
-		sv.bcpBuf = sv.bcpBuf[:0]
-	cnfLoop:
-		for _, clause := range sv.clauses {
-			foundUnassigned := false
-			var lit literal
-		clauseLoop:
-			for _, lit1 := range clause {
-				v := int(lit1 >> 1)
-				assn := sv.assignments[v]
-				// if i == 9 {
-				// fmt.Printf("  i=%d, v=%d; lit1=%d; assn=%s\n", i, v, lit1, assn)
-				// }
-				if assn == unassigned {
-					if foundUnassigned {
-						// Multiple unassigned; not unit.
-						continue cnfLoop
-					}
-					lit = lit1
-					foundUnassigned = true
-					continue clauseLoop
-				}
-				if lit1.assn() == assn {
-					// Clause already satisfied.
-					continue cnfLoop
-				}
-			}
-			if !foundUnassigned {
-				// Conflict.
-				// fmt.Print("  conflict!")
-				return false
-			}
-			// fmt.Printf("  unit clause at %d (lit=%d)\n", i, lit)
-			// Found a unit clause.
-			sv.bcpBuf = append(sv.bcpBuf, lit)
+		imps := sv.implications[sv.propIndex:]
+		if verbose {
+			fmt.Printf("  bcp loop | %s\n", sv.stateString())
 		}
-
-		if len(sv.bcpBuf) == 0 {
-			// No more implications.
+		if len(imps) == 0 {
+			// No implications left to propagate.
+			if verbose {
+				fmt.Println("  no more implications")
+			}
 			return true
 		}
-
-		for _, lit := range sv.bcpBuf {
-			v := int(lit >> 1)
-			assn := lit.assn()
-			// If v is unassigned or matches lit already, good.
-			// But if it is already assigned the inverse, we found a conflict.
-			switch sv.assignments[v] {
-			case unassigned:
-			case assn:
-				continue
-			default:
-				// fmt.Printf("  conflict on %d\n", v)
-				return false
+		sv.propIndex = len(sv.implications)
+		for _, impliedLit := range imps {
+			neg := impliedLit ^ 1
+			if verbose {
+				fmt.Printf("  checking impl %d by visiting watches for %d\n",
+					sv.origLit(impliedLit), sv.origLit(neg))
 			}
-			sv.assignments[v] = assn
-			// fmt.Printf("  implication: %d is %s | %s\n", v, assn, sv.stateString())
-			sv.deleteUnassigned(v)
-			sv.numImplications++
-			sv.implications = append(sv.implications, v)
+			watches := sv.watches[neg]
+		watchesLoop:
+			for i := 0; i < len(watches); {
+				clauseIdx := watches[i]
+				cls := sv.clauses[clauseIdx]
+				otherWatch := cls.watches[0]
+				if otherWatch == neg {
+					otherWatch = cls.watches[1]
+				}
+				state := assnFalse
+				for _, lit := range cls.lits {
+					if lit == neg {
+						continue
+					}
+					assn := lit.assn()
+					v := int(lit >> 1)
+					switch sv.assignments[v] {
+					case unassigned:
+						if state == assnFalse {
+							state = unassigned
+						}
+					case assn:
+						state = assnTrue
+					default:
+						// Literal is false already.
+						continue
+					}
+					if lit == otherWatch {
+						continue
+					}
+					// We know that lit is available to become the replacement
+					// watch literal.
+					sv.watches[lit] = append(sv.watches[lit], clauseIdx)
+					// Remove from the neg watch list.
+					watches[i], watches[len(watches)-1] = watches[len(watches)-1], watches[i]
+					watches = watches[:len(watches)-1]
+					sv.watches[neg] = watches
+					sv.clauses[clauseIdx].watches = [2]literal{lit, otherWatch}
+					continue watchesLoop
+				}
+				i++
+				switch state {
+				case assnTrue:
+					// Clause is satisified already; nothing to do.
+					continue
+				case assnFalse:
+					// No satisfiable literals in this clause: conflict.
+					if verbose {
+						fmt.Printf("  conflict at clause %d\n", clauseIdx)
+					}
+					return false
+				}
+				// This is now a unit clause and the other watch literal is implied.
+				v := int(otherWatch >> 1)
+				if verbose {
+					fmt.Printf("  clause %d is unit (imp: %d)\n", clauseIdx, sv.origLit(otherWatch))
+				}
+				if sv.assignments[v] == unassigned {
+					if verbose {
+						fmt.Printf("    assigning to %s\n", otherWatch.assn())
+					}
+					sv.assignments[v] = otherWatch.assn()
+					sv.deleteUnassigned(v)
+					sv.numImplications++
+					sv.implications = append(sv.implications, otherWatch)
+				}
+			}
 		}
 	}
-
 }
 
 func (sv *solver) stateString() string {
@@ -234,16 +290,34 @@ func (sv *solver) stateString() string {
 		if i > 0 {
 			s = ", "
 		}
-		fmt.Fprintf(&b, "%s%d:%c", s, i, assn.String()[0])
+		fmt.Fprintf(&b, "%s%d:%c", s, sv.origVars[i], assn.String()[0])
 	}
-	b.WriteByte('}')
+	b.WriteString("} watch: {")
+	for lit, watches := range sv.watches {
+		var s string
+		if lit > 0 {
+			s = ", "
+		}
+		fmt.Fprintf(&b, "%s%d->%v", s, sv.origLit(literal(lit)), watches)
+	}
+	b.WriteString("}")
 	return b.String()
+}
+
+func (sv *solver) origLit(lit literal) int {
+	x := sv.origVars[lit>>1]
+	if lit&1 == 1 {
+		return -x
+	}
+	return x
 }
 
 // resolveConflict tries to fix the current conflict by flipping the most
 // recently made decision.
 func (sv *solver) resolveConflict() bool {
-	// fmt.Println("  resolveConflict")
+	if verbose {
+		fmt.Println("  resolveConflict")
+	}
 	di := -1
 	var d decision
 	for i := len(sv.decisions) - 1; i >= 0; i-- {
@@ -258,15 +332,19 @@ func (sv *solver) resolveConflict() bool {
 		return false // not satisfiable
 	}
 	// Flip d from true to false and roll back the invalidated implications.
-	sv.decisions = sv.decisions[:di+1]
-	sv.assignments[d.v] = assnFalse
-	// fmt.Printf("  assigning %d to false | %s\n", d.v, sv.stateString())
+	if verbose {
+		fmt.Printf("  assigning %d->false | %s\n", sv.origVars[d.v], sv.stateString())
+	}
 	for i := len(sv.implications) - 1; i > d.implicationIdx; i-- {
-		v := sv.implications[i]
+		v := int(sv.implications[i] >> 1)
 		sv.addUnassigned(v)
 		sv.assignments[v] = unassigned
 	}
 	sv.implications = sv.implications[:d.implicationIdx+1]
+	sv.implications[len(sv.implications)-1] ^= 1
+	sv.decisions = sv.decisions[:di+1]
+	sv.assignments[d.v] = assnFalse
+	sv.propIndex = d.implicationIdx
 	return true
 }
 
