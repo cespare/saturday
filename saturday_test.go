@@ -8,7 +8,7 @@ import (
 )
 
 func TestFixtures(t *testing.T) {
-	for _, tt := range loadFixtures(t) {
+	for _, tt := range loadFixtures(t, false) {
 		if tt.sat {
 			t.Run(tt.name, func(t *testing.T) {
 				testFixtureSat(t, tt.problem)
@@ -22,7 +22,7 @@ func TestFixtures(t *testing.T) {
 }
 
 func BenchmarkFixtures(b *testing.B) {
-	for _, bb := range loadFixtures(b) {
+	for _, bb := range loadFixtures(b, true) {
 		b.Run(bb.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				sv := newSolver(bb.problem)
@@ -40,10 +40,17 @@ type fixtureTest struct {
 	sat     bool
 }
 
-func loadFixtures(tb testing.TB) []fixtureTest {
-	filenames, err := filepath.Glob("testdata/*.cnf")
+func loadFixtures(tb testing.TB, onlyBench bool) []fixtureTest {
+	filenames, err := filepath.Glob("testdata/bench/*.cnf")
 	if err != nil {
 		tb.Fatal(err)
+	}
+	if !onlyBench {
+		nonBench, err := filepath.Glob("testdata/*.cnf")
+		if err != nil {
+			tb.Fatal(err)
+		}
+		filenames = append(filenames, nonBench...)
 	}
 	var tests []fixtureTest
 	for _, filename := range filenames {
