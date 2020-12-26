@@ -150,6 +150,14 @@ type decision struct {
 }
 
 func (sv *solver) solve() bool {
+	// Handle empty clauses separately so we can assume there aren't any in
+	// the main solve routines.
+	for _, cls := range sv.clauses {
+		if len(cls.lits) == 0 {
+			return false
+		}
+	}
+
 	for {
 		if verbose {
 			fmt.Println("solve loop", sv.unassigned)

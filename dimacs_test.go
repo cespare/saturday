@@ -15,7 +15,21 @@ func TestParseDIMACS(t *testing.T) {
 	}{
 		{
 			text: `
-c Trivial
+c No vars or clauses
+p cnf 0 0
+`,
+			want: [][]int{},
+		},
+		{
+			text: `
+c No clauses
+p cnf 1 0
+`,
+			want: [][]int{},
+		},
+		{
+			text: `
+c 1 var, 1 clause
 p cnf 1 1
 1 0
 `,

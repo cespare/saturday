@@ -61,10 +61,10 @@ func ParseDIMACS(r io.Reader) ([][]int, error) {
 			if err != nil {
 				return nil, fmt.Errorf("malformed #clauses in problem line: %s", err)
 			}
-			if problem.vars <= 0 {
+			if problem.vars < 0 {
 				return nil, fmt.Errorf("invalid #vars %d", problem.vars)
 			}
-			if problem.clauses <= 0 {
+			if problem.clauses < 0 {
 				return nil, fmt.Errorf("invalid #clauses %d", problem.clauses)
 			}
 			continue
