@@ -4,10 +4,30 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 type solver struct {
-	origVars []int
+	// sourceVars lists each input var (we don't care that these are
+	// contiguous; any integer values other than zero will do).
+	//
+	// If there are any input clauses with a single var, we make that
+	// assignment directly and don't include this clause in our solver
+	// database at all.
+	//
+	// If during simplification we discover that the formula is trivially
+	// satisfiable or unsatisfiable, we set simpleSat to assnTrue/assnFalse
+	// and skip running the solver.
+	sourceVars []sourceVar
+	simpleSat  assnVal
+	// simplified is the minimized problem input that doesn't include the
+	// vars already assigned in sourceVars.
+	simplified [][]int
+
+	// Everything below is the internal solver state for the vars that can't
+	// be trivially assigned based on the input.
+
+	origVars []int // mapping of internal var back to source var
 
 	assignments []assnVal
 	watches     [][]int // watch literals (one for each literal; len is 2*len(assignments))
@@ -27,6 +47,17 @@ type solver struct {
 	numImplications int64
 }
 
+type sourceVar struct {
+	// If assn is unassigned, i is the index of the corresponding solver var
+	// (i.e., i is an index into assignments and other slices).
+	// If assn is assnTrue or assnFalse, it means we directly assigned a
+	// unit clause from the input and this source var does not appear in the
+	// solver's database.
+	v    int
+	assn assnVal
+	i    int
+}
+
 type clause struct {
 	watches [2]literal
 	lits    []literal
@@ -35,16 +66,14 @@ type clause struct {
 const verbose = false
 
 func newSolver(cnf [][]int) *solver {
-	sv := new(solver)
-	vars := make(map[int]int)
-	for _, cls := range cnf {
+	sv := simplify(cnf)
+	if sv.simpleSat != unassigned {
+		return sv
+	}
+	vars := make(map[int]int) // not including vars assigned in simplify
+	for _, cls := range sv.simplified {
 		for _, v := range cls {
-			if v == 0 {
-				panic("zero value passed to Solve")
-			}
-			if v < 0 {
-				v = -v
-			}
+			v = abs(v)
 			if _, ok := vars[v]; !ok {
 				sv.origVars = append(sv.origVars, v)
 				vars[v] = 0
@@ -55,6 +84,11 @@ func newSolver(cnf [][]int) *solver {
 	for i, v := range sv.origVars {
 		vars[v] = i
 	}
+	for i, v := range sv.sourceVars {
+		if v.assn == unassigned {
+			sv.sourceVars[i].i = vars[v.v]
+		}
+	}
 	sv.unassigned = make([]int, len(sv.origVars))
 	sv.unassignedIndex = make([]int, len(sv.origVars))
 	for i := range sv.unassigned {
@@ -63,11 +97,9 @@ func newSolver(cnf [][]int) *solver {
 	}
 	sv.assignments = make([]assnVal, len(sv.origVars))
 	sv.watches = make([][]int, len(sv.origVars)*2)
-	sv.clauses = make([]clause, len(cnf))
-	for i, cls := range cnf {
+	sv.clauses = make([]clause, len(sv.simplified))
+	for i, cls := range sv.simplified {
 		var watchesAdded int
-		// Detect and delete duplicates.
-		seen := make(map[literal]struct{}, len(cls))
 		for _, v := range cls {
 			neg := false
 			if v < 0 {
@@ -78,10 +110,6 @@ func newSolver(cnf [][]int) *solver {
 			if neg {
 				lit ^= 1
 			}
-			if _, ok := seen[lit]; ok {
-				continue
-			}
-			seen[lit] = struct{}{}
 			sv.clauses[i].lits = append(sv.clauses[i].lits, lit)
 			if watchesAdded < 2 {
 				sv.watches[lit] = append(sv.watches[lit], i)
@@ -93,22 +121,137 @@ func newSolver(cnf [][]int) *solver {
 	return sv
 }
 
+// simplify does a round of trivial simplifications on problem by looking for
+// empty and unit clauses, assigning these, and then iterating until a fixpoint
+// is located.
+//
+// The result is returned in the form of a solver sv with only sv.sourceVars and
+// sv.simplified set (as well as sv.simpleSat, if the problem is trivially
+// sat/unsat).
+func simplify(problem [][]int) *solver {
+	var sv solver
+	vars := make(map[int]assnVal)
+	sv.simplified = make([][]int, len(problem))
+	for i, cls := range problem {
+		seen := make(map[int]struct{})
+		var clause1 []int
+		for _, v := range cls {
+			if v == 0 {
+				panic("zero var passed to Solve")
+			}
+			// Get rid of duplicate literals.
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			clause1 = append(clause1, v)
+			vars[abs(v)] = unassigned
+		}
+		sv.simplified[i] = clause1
+	}
+	changed := true
+	for changed {
+		if len(sv.simplified) == 0 {
+			sv.simpleSat = assnTrue
+			// Pick an arbitrary assignment for the unassigned vars.
+			for v, assn := range vars {
+				if assn == unassigned {
+					vars[v] = assnTrue
+				}
+			}
+			break
+		}
+		changed = false
+		var i int
+	clauseLoop:
+		for _, cls := range sv.simplified {
+			if len(cls) == 0 {
+				if verbose {
+					fmt.Println("simplify: unsat (empty clause)")
+				}
+				sv.simpleSat = assnFalse
+				return &sv
+			}
+			if len(cls) == 1 {
+				v := cls[0]
+				assn := assnTrue
+				if v < 0 {
+					assn = assnFalse
+					v = -v
+				}
+				if vars[v] != unassigned && vars[v] != assn {
+					if verbose {
+						fmt.Printf("simplify: unsat (contradiction on %d)\n", v)
+					}
+					sv.simpleSat = assnFalse
+					return &sv
+				}
+				if verbose {
+					fmt.Printf("simplify: assigning %d->%s\n", v, assn)
+				}
+				vars[v] = assn
+				changed = true
+				continue clauseLoop
+			}
+			var j int
+			for _, v := range cls {
+				assn := vars[abs(v)]
+				if assn == unassigned {
+					cls[j] = v
+					j++
+					continue
+				}
+				changed = true
+				if (assn == assnTrue) == (v > 0) {
+					// Clause is already satisfied.
+					continue clauseLoop
+				}
+				// Literal is false and can be dropped.
+			}
+			sv.simplified[i] = cls[:j]
+			i++
+		}
+		sv.simplified = sv.simplified[:i]
+	}
+	sv.sourceVars = make([]sourceVar, 0, len(vars))
+	for v, assn := range vars {
+		sv.sourceVars = append(sv.sourceVars, sourceVar{v: v, assn: assn})
+	}
+	sort.Slice(sv.sourceVars, func(i, j int) bool {
+		return sv.sourceVars[i].v < sv.sourceVars[j].v
+	})
+	return &sv
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
 func Solve(cnf [][]int) ([]int, bool) {
 	sv := newSolver(cnf)
 	if !sv.solve() {
 		return nil, false
 	}
 
-	for i, assn := range sv.assignments {
+	soln := make([]int, len(sv.sourceVars))
+	for i, v := range sv.sourceVars {
+		assn := v.assn
+		if assn == unassigned {
+			assn = sv.assignments[v.i]
+		}
 		switch assn {
 		case assnFalse:
-			sv.origVars[i] *= -1
+			soln[i] = -v.v
 		case assnTrue:
+			soln[i] = v.v
 		default:
 			panic("incomplete solution")
 		}
 	}
-	return sv.origVars, true
+	return soln, true
 }
 
 // A literal represents an instance of a variable or its negation in a clause.
@@ -150,17 +293,23 @@ type decision struct {
 }
 
 func (sv *solver) solve() bool {
-	// Handle empty clauses separately so we can assume there aren't any in
-	// the main solve routines.
-	for _, cls := range sv.clauses {
-		if len(cls.lits) == 0 {
-			return false
+	switch sv.simpleSat {
+	case assnTrue:
+		if verbose {
+			fmt.Println("problem was found satisfiable during simplification")
 		}
+		return true
+	case assnFalse:
+		if verbose {
+			fmt.Println("problem was found unsatisfiable during simplification")
+		}
+		return false
 	}
 
 	for {
 		if verbose {
-			fmt.Println("solve loop", sv.unassigned)
+			fmt.Println("solve loop")
+			time.Sleep(500 * time.Millisecond)
 		}
 		v, ok := sv.popUnassigned()
 		if !ok {
