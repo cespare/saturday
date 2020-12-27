@@ -1,6 +1,8 @@
 package saturday
 
 import (
+	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +20,39 @@ func TestFixtures(t *testing.T) {
 				testFixtureUnsat(t, tt.problem)
 			})
 		}
+	}
+}
+
+func TestRandomized(t *testing.T) {
+	for _, tt := range []struct {
+		numVars    int
+		numClauses int
+		numSeeds   int
+	}{
+		{2, 2, 10},
+		{3, 10, 100},
+		{5, 10, 1000},
+		{10, 20, 1000},
+	} {
+		name := fmt.Sprintf("vars=%d,clauses=%d", tt.numVars, tt.numClauses)
+		t.Run(name, func(t *testing.T) {
+			for seed := 0; seed < tt.numSeeds; seed++ {
+				problem := makeRandomSat(int64(seed), tt.numVars, tt.numClauses)
+				var b strings.Builder
+				if err := WriteDIMACS(&b, problem); err != nil {
+					panic(err)
+				}
+				text := b.String()
+				soln, ok := Solve(problem)
+				if !ok {
+					t.Fatalf("[seed=%d] got UNSAT:\n\n%s\n", seed, text)
+				}
+				if !solutionIsValid(problem, soln) {
+					t.Fatalf("[seed=%d] got incorrect solution:\n\n%v\n\n%s\n",
+						seed, soln, text)
+				}
+			}
+		})
 	}
 }
 
@@ -81,6 +116,12 @@ func testFixtureSat(t *testing.T, problem [][]int) {
 	if !ok {
 		t.Fatalf("got UNSAT; want SAT")
 	}
+	if !solutionIsValid(problem, soln) {
+		t.Fatalf("got assignment %v, but it is not a solution to this SAT problem", soln)
+	}
+}
+
+func solutionIsValid(problem [][]int, soln []int) bool {
 	vars := make(map[int]bool)
 	for _, v := range soln {
 		if v < 0 {
@@ -98,8 +139,9 @@ clauseLoop:
 				continue clauseLoop
 			}
 		}
-		t.Fatalf("got assignment %v, but it is not a solution to this SAT problem", soln)
+		return false
 	}
+	return true
 }
 
 func testFixtureUnsat(t *testing.T, problem [][]int) {
@@ -107,4 +149,63 @@ func testFixtureUnsat(t *testing.T, problem [][]int) {
 	if ok {
 		t.Fatalf("got SAT with assignment %v; expected UNSAT", soln)
 	}
+}
+
+func makeRandomSat(seed int64, numVars, numClauses int) [][]int {
+	rng := rand.New(rand.NewSource(seed))
+	assignment := make([]bool, numVars)
+	for v := range assignment {
+		if rng.Intn(2) == 1 {
+			assignment[v] = true
+		}
+	}
+	vars := make([]int, numVars)
+	for v := range vars {
+		vars[v] = v
+	}
+	problem := make([][]int, numClauses)
+	for i := range problem {
+		rng.Shuffle(len(vars), func(i, j int) {
+			vars[i], vars[j] = vars[j], vars[i]
+		})
+		problem[i] = make([]int, rng.Intn(numVars)+1)
+		fixed := rng.Intn(len(problem[i])) // pick one literal to match assignment
+		for j := range problem[i] {
+			v := vars[j] + 1
+			if j == fixed {
+				if !assignment[v-1] {
+					v = -v
+				}
+			} else {
+				if rng.Intn(2) == 1 {
+					v = -v
+				}
+			}
+			problem[i][j] = v
+		}
+	}
+	// Remap vars to a contiguous set in [1, n] (where n is the number of
+	// vars we actually ended up using).
+	remap := make(map[int]int)
+	for _, cls := range problem {
+		for i, v := range cls {
+			neg := false
+			if v < 0 {
+				neg = true
+				v = -v
+			}
+			if x, ok := remap[v]; ok {
+				v = x
+			} else {
+				x := len(remap) + 1
+				remap[v] = x
+				v = x
+			}
+			if neg {
+				v = -v
+			}
+			cls[i] = v
+		}
+	}
+	return problem
 }
