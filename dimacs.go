@@ -113,3 +113,51 @@ func ParseDIMACS(r io.Reader) ([][]int, error) {
 	}
 	return clauses, nil
 }
+
+// WriteDIMACS writes out the given problem in the DIMACS CNF format to w.
+// It returns a non-nil error if the problem's variables don't form a contiguous
+// set [1, n].
+func WriteDIMACS(w io.Writer, problem [][]int) error {
+	seen := make(map[int]struct{})
+	var max int
+	for _, cls := range problem {
+		for _, v := range cls {
+			if v == 0 {
+				return errors.New("problem contains a 0 value")
+			}
+			if v < 0 {
+				v = -v
+			}
+			seen[v] = struct{}{}
+			if v > max {
+				max = v
+			}
+		}
+	}
+	if max != len(seen) {
+		return fmt.Errorf("problem has %d variables but largest var is %d (missing vars?)", len(seen), max)
+	}
+	bw := bufio.NewWriter(w)
+	if _, err := fmt.Fprintf(bw, "p cnf %d %d\n", len(seen), len(problem)); err != nil {
+		return err
+	}
+	for _, cls := range problem {
+		for i, v := range cls {
+			var s string
+			if i > 0 {
+				s = " "
+			}
+			if _, err := fmt.Fprintf(bw, "%s%d", s, v); err != nil {
+				return err
+			}
+		}
+		var s string
+		if len(cls) > 0 {
+			s = " "
+		}
+		if _, err := fmt.Fprintf(bw, "%s0\n", s); err != nil {
+			return err
+		}
+	}
+	return bw.Flush()
+}
