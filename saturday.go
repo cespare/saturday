@@ -4,9 +4,12 @@
 package saturday
 
 import (
+	"container/heap"
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/kr/pretty"
 )
 
 type solver struct {
@@ -34,8 +37,7 @@ type solver struct {
 	assignments []assnVal
 	watches     [][]int // watch literals (one for each literal; len is 2*len(assignments))
 
-	unassigned      []int // unassigned vars (indexes into assignments; unordered)
-	unassignedIndex []int // index of each var in unassigned (or -1)
+	unassigned litHeap // unassigned vars organized as a max-heap of literals ordered by watch list size
 
 	decisions    []decision // assigned vars from decision
 	implications []literal  // implied literals from decisions & further implications
@@ -65,6 +67,49 @@ type clause struct {
 	lits []literal
 }
 
+type litHeap struct {
+	watches [][]int         // reference to parent sv.watches
+	lits    []litHeapItem   // max-heap slice
+	m       map[literal]int // literal -> index in lits
+}
+
+type litHeapItem struct {
+	lit literal
+	i   int // position in q
+}
+
+func (h *litHeap) Len() int { return len(h.lits) }
+
+func (h *litHeap) Less(i, j int) bool {
+	lit0, lit1 := h.lits[i].lit, h.lits[j].lit
+	return len(h.watches[lit0]) > len(h.watches[lit1])
+}
+
+func (h *litHeap) Swap(i, j int) {
+	e0, e1 := h.lits[i], h.lits[j]
+	e0.i = j
+	e1.i = i
+	h.lits[i] = e1
+	h.lits[j] = e0
+	h.m[e0.lit] = j
+	h.m[e1.lit] = i
+}
+
+func (h *litHeap) Push(x interface{}) {
+	elt := x.(litHeapItem)
+	h.m[elt.lit] = len(h.lits)
+	elt.i = len(h.lits)
+	h.lits = append(h.lits, elt)
+}
+
+func (h *litHeap) Pop() interface{} {
+	elt := h.lits[len(h.lits)-1]
+	h.lits = h.lits[:len(h.lits)-1]
+	elt.i = -1
+	delete(h.m, elt.lit)
+	return elt
+}
+
 const verbose = false
 
 func newSolver(problem [][]int) *solver {
@@ -91,14 +136,8 @@ func newSolver(problem [][]int) *solver {
 			sv.sourceVars[i].i = vars[v.v]
 		}
 	}
-	sv.unassigned = make([]int, len(sv.origVars))
-	sv.unassignedIndex = make([]int, len(sv.origVars))
-	for i := range sv.unassigned {
-		sv.unassigned[i] = len(sv.origVars) - i - 1
-		sv.unassignedIndex[i] = len(sv.origVars) - i - 1
-	}
-	sv.assignments = make([]assnVal, len(sv.origVars))
 	sv.watches = make([][]int, len(sv.origVars)*2)
+	sv.assignments = make([]assnVal, len(sv.origVars))
 	sv.clauses = make([]clause, len(sv.simplified))
 	for i, cls := range sv.simplified {
 		for j, v := range cls {
@@ -115,6 +154,13 @@ func newSolver(problem [][]int) *solver {
 			if j < 2 {
 				sv.watches[lit] = append(sv.watches[lit], i)
 			}
+		}
+	}
+	sv.unassigned.watches = sv.watches
+	sv.unassigned.m = make(map[literal]int)
+	for lit, watches := range sv.watches {
+		if len(watches) > 0 {
+			sv.pushUnassigned(literal(lit))
 		}
 	}
 	return sv
@@ -256,7 +302,7 @@ func Solve(problem [][]int) (assignment []int, stats map[string]interface{}, sat
 	for i, v := range sv.sourceVars {
 		assn := v.assn
 		if assn == unassigned {
-			assn = sv.assignments[v.i]
+			assn = sv.assignments[v.i] & 3
 		}
 		switch assn {
 		case assnFalse:
@@ -286,6 +332,11 @@ const (
 	unassigned assnVal = 0
 	assnTrue   assnVal = 1
 	assnFalse  assnVal = 2
+	// The second values are used only in sv.assignments to indicate that an
+	// assignment is being tried for a second time. The values are the same
+	// as assnTrue/assnFalse but with another bit set.
+	assnTrueSecond  assnVal = 5
+	assnFalseSecond assnVal = 6
 )
 
 func (a assnVal) inv() assnVal { return a ^ 3 }
@@ -294,9 +345,9 @@ func (a assnVal) String() string {
 	switch a {
 	case unassigned:
 		return "unassigned"
-	case assnTrue:
+	case assnTrue, assnTrueSecond:
 		return "true"
-	case assnFalse:
+	case assnFalse, assnFalseSecond:
 		return "false"
 	default:
 		panic("unreached")
@@ -305,7 +356,7 @@ func (a assnVal) String() string {
 
 type decision struct {
 	implicationIdx int
-	v              int
+	lit            literal
 }
 
 func (sv *solver) solve() bool {
@@ -326,22 +377,24 @@ func (sv *solver) solve() bool {
 		if verbose {
 			fmt.Println("solve loop")
 		}
-		v, ok := sv.popUnassigned()
+		// Decide on the next var to set.
+		lit, ok := sv.popUnassigned()
 		if !ok {
 			return true
 		}
-		// Decide: set a var to true.
-		sv.assignments[v] = assnTrue
+		sv.deleteUnassigned(lit ^ 1)
+		v := lit >> 1
+		sv.assignments[v] = lit.assn()
 		sv.numDecisions++
 		if verbose {
-			fmt.Printf("assigning %d->true | %s\n", sv.origVars[v], sv.stateString())
+			fmt.Printf("assigning %d->%s | %s\n", sv.origVars[v], lit.assn(), sv.stateString())
 		}
 		sv.decisions = append(sv.decisions, decision{
 			implicationIdx: len(sv.implications),
-			v:              v,
+			lit:            lit,
 		})
 		sv.propIndex = len(sv.implications)
-		sv.implications = append(sv.implications, literal(v<<1))
+		sv.implications = append(sv.implications, lit)
 
 		for !sv.bcp() {
 			if !sv.resolveConflict() {
@@ -396,7 +449,7 @@ func (sv *solver) bcp() bool {
 					panic("bad watch var state")
 				}
 				lit0 := cls.lits[0]
-				if sv.assignments[lit0>>1] == lit0.assn() {
+				if sv.assignments[lit0>>1]&3 == lit0.assn() {
 					// Clause is already satisfied by the other watch.
 					// Don't bother updating it further.
 					i++
@@ -405,13 +458,17 @@ func (sv *solver) bcp() bool {
 				// Look for a replacement watch.
 				for j := 2; j < len(cls.lits); j++ {
 					lit := cls.lits[j]
-					if sv.assignments[lit>>1] == lit.assn().inv() {
+					assn := sv.assignments[lit>>1] & 3
+					if assn == lit.assn().inv() {
 						// Literal is false already.
 						continue
 					}
 					// We know that lit is available to become the replacement
 					// watch literal.
 					sv.watches[lit] = append(sv.watches[lit], clauseIdx)
+					if assn == unassigned {
+						sv.updateUnassigned(lit)
+					}
 					// Remove from the neg watch list.
 					watches[i], watches[len(watches)-1] = watches[len(watches)-1], watches[i]
 					watches = watches[:len(watches)-1]
@@ -436,7 +493,11 @@ func (sv *solver) bcp() bool {
 					fmt.Printf("    assigning to %s\n", otherWatch.assn())
 				}
 				sv.assignments[v] = otherWatch.assn()
-				sv.deleteUnassigned(v)
+				fmt.Printf("\033[01;34m>>>> otherWatch: %v\x1B[m\n", otherWatch)
+				fmt.Printf("\033[01;34m>>>> sv.watches[otherWatch]: %v\x1B[m\n", sv.watches[otherWatch])
+				fmt.Printf("\033[01;34m>>>> sv.unassigned.m[otherWatch]: %v\x1B[m\n", sv.unassigned.m[otherWatch])
+				pretty.Println(sv.unassigned)
+				sv.deleteUnassigned(otherWatch)
 				sv.numImplications++
 				sv.implications = append(sv.implications, otherWatch)
 			}
@@ -484,7 +545,7 @@ func (sv *solver) resolveConflict() bool {
 	var d decision
 	for i := len(sv.decisions) - 1; i >= 0; i-- {
 		d = sv.decisions[i]
-		if sv.assignments[d.v] == assnTrue {
+		if sv.assignments[d.lit>>1]&4 == 0 {
 			// d hasn't been tried both ways yet.
 			di = i
 			break
@@ -493,46 +554,52 @@ func (sv *solver) resolveConflict() bool {
 	if di == -1 {
 		return false // not satisfiable
 	}
-	// Flip d from true to false and roll back the invalidated implications.
+	// Flip d's assignment and roll back the invalidated implications.
 	if verbose {
-		fmt.Printf("  assigning %d->false | %s\n", sv.origVars[d.v], sv.stateString())
+		fmt.Printf("  assigning %d->%s | %s\n",
+			sv.origVars[d.lit>>1], d.lit.assn().inv(), sv.stateString())
 	}
 	for i := len(sv.implications) - 1; i > d.implicationIdx; i-- {
-		v := int(sv.implications[i] >> 1)
-		sv.addUnassigned(v)
-		sv.assignments[v] = unassigned
+		lit := sv.implications[i]
+		sv.pushUnassigned(lit)
+		sv.assignments[lit>>1] = unassigned
 	}
 	sv.implications = sv.implications[:d.implicationIdx+1]
 	sv.implications[len(sv.implications)-1] ^= 1
 	sv.decisions = sv.decisions[:di+1]
-	sv.assignments[d.v] = assnFalse
+	sv.decisions[di].lit ^= 1
+	sv.assignments[d.lit>>1] ^= 5 // flip bit 0, set bit 2
 	sv.propIndex = d.implicationIdx
 	return true
 }
 
-func (sv *solver) popUnassigned() (int, bool) {
-	if len(sv.unassigned) == 0 {
+func (sv *solver) pushUnassigned(lit literal) {
+	if _, ok := sv.unassigned.m[lit]; ok {
+		panic("push of literal that's already in the unassigned queue")
+	}
+	heap.Push(&sv.unassigned, litHeapItem{lit: lit})
+}
+
+func (sv *solver) popUnassigned() (literal, bool) {
+	if len(sv.unassigned.lits) == 0 {
 		return 0, false
 	}
-	v := sv.unassigned[len(sv.unassigned)-1]
-	sv.unassigned = sv.unassigned[:len(sv.unassigned)-1]
-	sv.unassignedIndex[v] = -1
-	return v, true
+	e := heap.Pop(&sv.unassigned).(litHeapItem)
+	return e.lit, true
 }
 
-func (sv *solver) deleteUnassigned(v int) {
-	i := sv.unassignedIndex[v]
-	last := sv.unassigned[len(sv.unassigned)-1]
-	sv.unassigned[i] = last
-	sv.unassigned = sv.unassigned[:len(sv.unassigned)-1]
-	sv.unassignedIndex[last] = i // last may be v
-	sv.unassignedIndex[v] = -1
-}
-
-func (sv *solver) addUnassigned(v int) {
-	if sv.unassignedIndex[v] != -1 {
-		panic("assigning already-assigned var")
+func (sv *solver) deleteUnassigned(lit literal) {
+	i, ok := sv.unassigned.m[lit]
+	if !ok {
+		panic("delete of nonexistent unassigned var")
 	}
-	sv.unassignedIndex[v] = len(sv.unassigned)
-	sv.unassigned = append(sv.unassigned, v)
+	heap.Remove(&sv.unassigned, i)
+}
+
+func (sv *solver) updateUnassigned(lit literal) {
+	if i, ok := sv.unassigned.m[lit]; ok {
+		heap.Fix(&sv.unassigned, i)
+	} else {
+		heap.Push(&sv.unassigned, litHeapItem{lit: lit})
+	}
 }
