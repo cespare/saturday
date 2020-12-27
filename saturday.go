@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 )
 
 type solver struct {
@@ -62,8 +61,8 @@ type sourceVar struct {
 }
 
 type clause struct {
-	watches [2]literal
-	lits    []literal
+	// The watch literals are the first two in the clause.
+	lits []literal
 }
 
 const verbose = false
@@ -102,8 +101,7 @@ func newSolver(problem [][]int) *solver {
 	sv.watches = make([][]int, len(sv.origVars)*2)
 	sv.clauses = make([]clause, len(sv.simplified))
 	for i, cls := range sv.simplified {
-		var watchesAdded int
-		for _, v := range cls {
+		for j, v := range cls {
 			neg := false
 			if v < 0 {
 				neg = true
@@ -114,10 +112,8 @@ func newSolver(problem [][]int) *solver {
 				lit ^= 1
 			}
 			sv.clauses[i].lits = append(sv.clauses[i].lits, lit)
-			if watchesAdded < 2 {
+			if j < 2 {
 				sv.watches[lit] = append(sv.watches[lit], i)
-				sv.clauses[i].watches[watchesAdded] = lit
-				watchesAdded++
 			}
 		}
 	}
@@ -292,7 +288,7 @@ const (
 	assnFalse  assnVal = 2
 )
 
-// func (a assnVal) inv() assnVal { return a ^ 3 }
+func (a assnVal) inv() assnVal { return a ^ 3 }
 
 func (a assnVal) String() string {
 	switch a {
@@ -329,7 +325,6 @@ func (sv *solver) solve() bool {
 	for {
 		if verbose {
 			fmt.Println("solve loop")
-			time.Sleep(500 * time.Millisecond)
 		}
 		v, ok := sv.popUnassigned()
 		if !ok {
@@ -393,29 +388,25 @@ func (sv *solver) bcp() bool {
 			for i := 0; i < len(watches); {
 				clauseIdx := watches[i]
 				cls := sv.clauses[clauseIdx]
-				otherWatch := cls.watches[0]
-				if otherWatch == neg {
-					otherWatch = cls.watches[1]
+				// Put the false literal at lits[1] and the
+				// other watch literal at lits[0].
+				if cls.lits[0] == neg {
+					cls.lits[0], cls.lits[1] = cls.lits[1], cls.lits[0]
+				} else if cls.lits[1] != neg {
+					panic("bad watch var state")
 				}
-				state := assnFalse
-				for _, lit := range cls.lits {
-					if lit == neg {
-						continue
-					}
-					assn := lit.assn()
-					v := int(lit >> 1)
-					switch sv.assignments[v] {
-					case unassigned:
-						if state == assnFalse {
-							state = unassigned
-						}
-					case assn:
-						state = assnTrue
-					default:
+				lit0 := cls.lits[0]
+				if sv.assignments[lit0>>1] == lit0.assn() {
+					// Clause is already satisfied by the other watch.
+					// Don't bother updating it further.
+					i++
+					continue
+				}
+				// Look for a replacement watch.
+				for j := 2; j < len(cls.lits); j++ {
+					lit := cls.lits[j]
+					if sv.assignments[lit>>1] == lit.assn().inv() {
 						// Literal is false already.
-						continue
-					}
-					if lit == otherWatch {
 						continue
 					}
 					// We know that lit is available to become the replacement
@@ -425,35 +416,29 @@ func (sv *solver) bcp() bool {
 					watches[i], watches[len(watches)-1] = watches[len(watches)-1], watches[i]
 					watches = watches[:len(watches)-1]
 					sv.watches[neg] = watches
-					sv.clauses[clauseIdx].watches = [2]literal{lit, otherWatch}
+					cls.lits[1], cls.lits[j] = cls.lits[j], cls.lits[1]
 					continue watchesLoop
 				}
 				i++
-				switch state {
-				case assnTrue:
-					// Clause is satisified already; nothing to do.
-					continue
-				case assnFalse:
-					// No satisfiable literals in this clause: conflict.
+				// This is either a unit clause with the other
+				// watch literal implied or it's already
+				// unsatisfiable if that literal is false.
+				otherWatch := cls.lits[0]
+				v := int(otherWatch >> 1)
+				if sv.assignments[v] != unassigned {
 					if verbose {
 						fmt.Printf("  conflict at clause %d\n", clauseIdx)
 					}
 					return false
 				}
-				// This is now a unit clause and the other watch literal is implied.
-				v := int(otherWatch >> 1)
 				if verbose {
 					fmt.Printf("  clause %d is unit (imp: %d)\n", clauseIdx, sv.origLit(otherWatch))
+					fmt.Printf("    assigning to %s\n", otherWatch.assn())
 				}
-				if sv.assignments[v] == unassigned {
-					if verbose {
-						fmt.Printf("    assigning to %s\n", otherWatch.assn())
-					}
-					sv.assignments[v] = otherWatch.assn()
-					sv.deleteUnassigned(v)
-					sv.numImplications++
-					sv.implications = append(sv.implications, otherWatch)
-				}
+				sv.assignments[v] = otherWatch.assn()
+				sv.deleteUnassigned(v)
+				sv.numImplications++
+				sv.implications = append(sv.implications, otherWatch)
 			}
 		}
 	}
