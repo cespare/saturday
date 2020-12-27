@@ -43,7 +43,7 @@ func TestRandomized(t *testing.T) {
 					panic(err)
 				}
 				text := b.String()
-				soln, ok := Solve(problem)
+				soln, _, ok := Solve(problem)
 				if !ok {
 					t.Fatalf("[seed=%d] got UNSAT:\n\n%s\n", seed, text)
 				}
@@ -112,7 +112,7 @@ func loadFixtures(tb testing.TB, onlyBench bool) []fixtureTest {
 }
 
 func testFixtureSat(t *testing.T, problem [][]int) {
-	soln, ok := Solve(problem)
+	soln, _, ok := Solve(problem)
 	if !ok {
 		t.Fatalf("got UNSAT; want SAT")
 	}
@@ -145,7 +145,7 @@ clauseLoop:
 }
 
 func testFixtureUnsat(t *testing.T, problem [][]int) {
-	soln, ok := Solve(problem)
+	soln, _, ok := Solve(problem)
 	if ok {
 		t.Fatalf("got SAT with assignment %v; expected UNSAT", soln)
 	}

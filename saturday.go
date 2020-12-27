@@ -1,3 +1,6 @@
+// Package saturday implements a SAT solver using the Davis-Putnam backtracking
+// algorithm plus a few optimizations as described in the 2001 paper
+// Chaff: Engineering an Efficient SAT Solver.
 package saturday
 
 import (
@@ -65,8 +68,8 @@ type clause struct {
 
 const verbose = false
 
-func newSolver(cnf [][]int) *solver {
-	sv := simplify(cnf)
+func newSolver(problem [][]int) *solver {
+	sv := simplify(problem)
 	if sv.simpleSat != unassigned {
 		return sv
 	}
@@ -230,10 +233,27 @@ func abs(n int) int {
 	return n
 }
 
-func Solve(cnf [][]int) ([]int, bool) {
-	sv := newSolver(cnf)
-	if !sv.solve() {
-		return nil, false
+// Solve determines whether a boolean formula is satisfiable and, if it is,
+// gives a satisfying assignment.
+//
+// The input is in CNF form where slice in problem is a clause. Each literal is
+// an integer and negative integers indicate negated variables. The set of
+// variables must form a contiguous set [1, n].
+//
+// The stats that are given back are purely informational. The set of stats and
+// their types may change at any time.
+func Solve(problem [][]int) (assignment []int, stats map[string]interface{}, sat bool) {
+	sv := newSolver(problem)
+	ok := sv.solve()
+
+	stats = map[string]interface{}{
+		"solved by simplification": sv.simpleSat != unassigned,
+		"num decisions":            sv.numDecisions,
+		"num implications":         sv.numImplications,
+	}
+
+	if !ok {
+		return nil, stats, false
 	}
 
 	soln := make([]int, len(sv.sourceVars))
@@ -251,7 +271,7 @@ func Solve(cnf [][]int) ([]int, bool) {
 			panic("incomplete solution")
 		}
 	}
-	return soln, true
+	return soln, stats, true
 }
 
 // A literal represents an instance of a variable or its negation in a clause.
